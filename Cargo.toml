@@ -13,36 +13,6 @@ categories = ["network-programming"]
 name = "sni-gate"
 path = "src/main.rs"
 
-# Terminal UI. SHELVED as of 2026-10-04: nothing in a default build, test run or
-# CI touches it. `src/lib.rs` declares the module under `#[cfg(feature = "tui")]`,
-# the binary below is `required-features`, and the three test targets after it are
-# too — so `cargo test --locked` does not even compile them.
-# To pick it back up: cargo test --features tui && cargo build --features tui
-# Visual language: docs/design-language.md §6. Usage: docs/tui.md.
-[[bin]]
-name = "sni-gate-tui"
-path = "src/bin/sni-gate-tui.rs"
-required-features = ["tui"]
-
-[[test]]
-name = "tui_visual_language"
-path = "tests/tui_visual_language.rs"
-required-features = ["tui"]
-
-[[test]]
-name = "tui_mouse"
-path = "tests/tui_mouse.rs"
-required-features = ["tui"]
-
-[[test]]
-name = "tui_surfaces"
-path = "tests/tui_surfaces.rs"
-required-features = ["tui"]
-
-[features]
-default = []
-tui = ["dep:ratatui"]
-
 [dependencies]
 anyhow = "1"
 thiserror = "2"
@@ -89,7 +59,6 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 time = "0.3"
-ratatui = { version = "0.30.2", optional = true }
 
 # Trusted-root installation: CryptoAPI on Windows, nothing extra elsewhere.
 [target.'cfg(windows)'.dependencies]

@@ -29,9 +29,6 @@ jobs:
           key: lint-${{ hashFiles('**/Cargo.lock') }}
       - name: Format check
         run: cargo fmt --all -- --check
-      # The terminal UI is shelved and must stay out of every CI path: it is
-      # feature-gated, its binary and its three test targets are
-      # `required-features = ["tui"]`, so this lint run never compiles it.
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -102,7 +99,5 @@ jobs:
       # Full suite: unit tests + integration tests (tests/e2e.rs launches the
       # binary against a mock backend and exercises TLS termination, dynamic
       # cert issuance, raw passthrough, and the half-close/WebSocket path).
-      # The shelved terminal UI is not part of this: its targets are
-      # `required-features = ["tui"]`, so `--locked` alone never compiles them.
       - name: Test
         run: cargo test --locked
