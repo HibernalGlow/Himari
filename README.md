@@ -1,1096 +1,289 @@
-# sni-gate
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="Himari：按 SNI 或 Host 路由、并现签该域名证书的多监听 TLS 网关">
+</p>
 
-A multi-listener TLS gateway that routes each connection by **SNI (TLS) or Host
-(HTTP)** to an upstream, and — whenever it terminates TLS — **issues a
-certificate for that name and its wildcard on the fly** from a local CA.
+<p align="center">
+  <a href="#top">中文</a> · <a href="#english">English</a>
+</p>
 
-Upstreams can be reached four ways: **ECH** (TLS 1.3 Encrypted Client Hello),
-plain **TLS**, cleartext **HTTP**, or **raw** TCP passthrough. Configuration is
-hierarchical (route → listener → global) for maximum flexibility: almost every
-setting can be pinned per route and otherwise inherits outward.
+<a id="top"></a>
 
-It merges two capabilities:
-- **Dynamic per-SNI certificate issuance** — no per-site cert maintenance; any
-  name gets a valid cert the first time it is requested, from a local CA you trust
-  once. Coverage is not guessed: the first handshake is answered exactly, and
-  wider coverage is mirrored from the upstream's own certificate. Certs are
-  cached and persisted.
-- **ECH re-origination** — hide the true SNI from the path to a CDN edge, giving
-  ECH to clients/environments that can't do it themselves.
+## Himari 是什么
 
-## How it works
+Himari 是一个**单二进制、多监听的 TLS 网关**。每条连接按 TLS 的 **SNI**（或 HTTP 的 `Host`）选路由；凡是它终止 TLS 的地方，都会**现签一张覆盖该名字的证书**——由本地 CA 签，除非该路由用 `cert_file`/`key_file` 钉了自己的证书（那样就不走 CA 了）。上游可以四种方式抵达：`ech`、`tls`、`http`、`raw`。配置是分层的（route → listener → global），几乎每一项都能在单条路由上钉死，否则向外继承。
 
-```
-                    issue per-SNI cert (exact, then mirrored from upstream)
-                         ┌────────────────────────────────────────┐
-                         │                                        ▼
- client ──TLS(SNI)/HTTP──▶ sni-gate :443 ── route by SNI/Host ──▶ upstream
-                              peek (no consume)                    · ech  → TLS1.3 + ECH
-                              exact>wildcard>suffix>regex          · tls  → plain TLS
-                                                                   · http → cleartext
-                                                                   · raw  → bare TCP (no termination)
-```
+> **命名说明**：Cargo package、二进制与默认配置文件目前仍沿用上游名 `sni-gate`（`sni-gate.toml`、`SNI_GATE_LOG`）。下面的命令按**实际产物**写，项目对外名称是 Himari。
 
-1. **Peek** the connection without consuming bytes to learn the routing key
-   (TLS SNI, or the HTTP `Host` header).
-2. **Route** it: `exact` > `wildcard *.x` > `suffix .x` > `regex @name` > the
-   listener's `default_route`.
-3. For any type except `raw`, **terminate inbound TLS**, issuing a certificate
-   for the SNI (and its wildcard) from the local CA, then **re-originate** to the
-   upstream per the route type. `raw` splices the untouched TCP stream through.
-4. No route and no `default_route` → apply the global `unmatched` policy.
+两件事是它存在的理由：
 
-## Listener address
+- **逐 SNI 现签证书** —— 不需要逐站维护证书。任何名字第一次被请求时就能拿到有效证书（你只需信任一次本地 CA）。覆盖范围**不是猜的**：首个握手精确应答，更宽的覆盖从上游自己的证书镜像而来。证书有缓存，也持久化到磁盘。
+- **ECH 重新发起** —— 对到 CDN 边缘这一段把真实 SNI 藏起来，让本身不支持 ECH 的客户端和环境也能用上。
 
-Each `[[listener]]` must have an `addr` field. Three accepted forms:
-
-| Form | Example | Result |
-|---|---|---|
-| Full IPv4 socket address | `"0.0.0.0:443"` | bind exactly as written |
-| Full IPv6 socket address | `"[::]:443"` | bind exactly as written |
-| Bare port (string or integer) | `"443"` or `443` | `0.0.0.0:<port>` |
-
-The bare-port shorthand binds the **IPv4 wildcard only**, matching nginx's
-`listen 443` semantics. On a dual-stack host, add a second listener on
-`"[::]:443"` to also accept IPv6 connections. Hostnames are not accepted;
-use a literal IP address.
-
-`"443"` and `"0.0.0.0:443"` normalize to the same address, so writing both
-in the same config is caught as a duplicate-listener error at startup.
-
-## Route types
-
-| Type   | Terminates inbound TLS? | Issues cert? | Upstream                         | HTTP/2                    |
-|--------|-------------------------|--------------|----------------------------------|---------------------------|
-| `ech`  | yes                     | yes          | TLS 1.3 + Encrypted Client Hello | mirrors upstream ALPN     |
-| `tls`  | yes                     | yes          | plain TLS (optional override SNI)| mirrors upstream ALPN     |
-| `http` | (cleartext in)          | yes (if TLS) | cleartext HTTP                   | h2 in → h2c out           |
-| `raw`  | no                      | no           | bare TCP byte-pump               | n/a (never terminates)    |
-
-`override_sni` works for **all** terminating types. For `ech` it is the inner
-(protected) name; for `tls` it is the SNI presented to the upstream:
-
-| `override_sni`  | SNI sent upstream                        |
-|-----------------|------------------------------------------|
-| *(omitted)*     | the inbound SNI verbatim                 |
-| `"name"`        | exactly `name`                           |
-| `""`            | **none** — no `server_name` extension    |
-
-The empty string is deliberately distinct from omitting the field: it suppresses
-the extension entirely. That is useful for an upstream addressed by IP or one
-that keys only off the certificate it serves, and for ECH, where [RFC 9849 §5]
-explicitly allows a ClientHelloInner to carry no SNI. With ECH the ECHConfig's
-public name is still sent in the *outer* hello (the client-facing server needs
-it); only the protected inner hello omits its `server_name`.
-
-Suppressing SNI changes what is **transmitted**, not what is **trusted**: the
-upstream certificate is still verified against the name the route would otherwise
-have sent (the fixed name, or the reflected inbound one). An `ech` route with
-`override_sni = ""` on a connection that carries no SNI/Host therefore has no
-inner name to verify against and is closed.
-
-Because resolution keys on *presence*, a route can blank out a name inherited
-from its template with `override_sni = ""`.
-
-[RFC 9849 §5]: https://www.rfc-editor.org/rfc/rfc9849.html#section-5
-
-## Named regular expressions
-
-Regular expressions in `match_sni` must be declared as `[regexes.<name>]` entries
-and referenced with an `@` prefix. Each regex carries a `scope_suffix` declaration
-that lets mirrored wildcards coexist safely with regex routes.
-
-```toml
-[regexes.cdn-upos]
-pattern = "^upos-[a-z0-9-]+\\.akamaized\\.net$"
-scope_suffix = ["*.akamaized.net"]
-
-[[listener.route]]
-match_sni = ["@cdn-upos", ".google.com"]
-upstream = "cdn.example.com"
-type = "tls"
-```
-
-### Why scope_suffix is required
-
-When deciding whether to issue a wildcard certificate like `*.example.com`, the
-router must verify that all hosts it would cover route to the same destination.
-For exact/wildcard/suffix patterns, this is statically decidable. For regex
-patterns, it is not—the program cannot determine which hosts a regex will match.
-
-`scope_suffix` is the operator's declaration: "this regex may match hosts under
-these domain suffixes." The router uses this to check for overlaps. If a wildcard
-`*.example.com` is requested for route A, and a regex in route B declares
-`scope_suffix = ["*.example.com"]`, the wildcard is refused to prevent incorrect
-HTTP/2 connection coalescing.
-
-### Syntax
-
-`scope_suffix` uses the same pattern grammar as route matching:
-
-- `"*.domain.com"` — matches only direct subdomains of `domain.com` (one label above it)
-- `".domain.com"` — matches `domain.com` itself plus all subdomains at any depth
-- `"domain.com"` — matches only the apex domain exactly
-
-A regex may declare multiple suffixes:
-```toml
-scope_suffix = ["*.cdn1.example.com", "*.cdn2.example.com"]
-```
-
-**The operator is responsible for ensuring the pattern does not match hosts outside
-the declared scope.** An under-declared scope may allow wildcard certificates that
-should be refused, leading to incorrect routing via HTTP/2 connection coalescing.
-
-## Upstream address
-
-`upstream` names the target to dial. Either part may be defaulted:
-
-| `upstream`          | dial host                       | dial port            |
-|---------------------|---------------------------------|----------------------|
-| `"host:port"`       | fixed host (IPv6 in `[...]`)    | fixed port           |
-| `"host"`            | fixed host                      | this listener's port |
-| `"8443"`            | matched source SNI/Host         | `8443`               |
-| *(omitted)*         | matched source SNI/Host         | this listener's port |
-
-When the host is defaulted it is the **matched source SNI/Host** — the routing
-key the connection matched on (the inbound SNI or Host, with any `:port`
-stripped), resolved per connection. This "reflects" each connection back to its
-own name, so a listener can forward every matched name to that same name
-upstream without a per-route host. `override_sni` does **not** change the dial
-target; it only sets the upstream TLS server name for `tls`/`ech`. A connection
-routed to a reflecting route that carries no SNI/Host is closed (there is
-nothing to reflect).
-
-## Upstream certificate verification
-
-A terminating route re-originates the connection, so it decides for itself what
-the upstream must prove. By default the upstream's certificate must chain to the
-web-PKI roots **and** be valid for the name the route asked for. That is what
-almost every route should keep.
-
-It is not always satisfiable, and the reason is structural. This gateway
-deliberately separates three things a browser keeps welded together: **who we
-dial** (`upstream`), **what name we transmit** (`override_sni`), and **what name
-we trust**. Once the second has moved, the third no longer follows from it. A
-route with `override_sni = ""` sends no SNI at all, so the upstream answers with
-its **default** certificate — issued for whatever name its operator chose, not
-for the one the client asked for:
-
-```
-upstream TLS handshake: invalid peer certificate: certificate not valid for name
-"fra-storage.example.com"; certificate is only valid for DnsName("*.example.net")
-```
-
-The handshake is sound; it simply does not prove the proposition the default
-policy checks. `[verify]` is where that proposition is stated.
-
-```toml
-  [[listener.route]]
-  match_sni = [".example.com"]
-  type = "tls"
-  override_sni = ""                 # send no SNI
-    [listener.route.verify]
-    name = "default.example.net"    # verify against what the upstream really serves
-```
-
-### `mode`
-
-| `mode`    | chains to a trust anchor | certificate name checked |
-|-----------|--------------------------|--------------------------|
-| `"full"`  | yes                      | yes — **the default**    |
-| `"chain"` | yes                      | no                       |
-| `"none"`  | no                       | no                       |
-
-### Two fields worth preferring over a weaker mode
-
-- **`name`** — verify against a *different* name, still in `full` mode. Chain,
-  expiry and name are all enforced; only the subject of the claim moves. This is
-  the right answer whenever the upstream serves a stable default certificate.
-  Route scope only (the route's own block or the template it `use`s), like
-  `upstream` — it describes one upstream's certificate, so writing it in
-  `[global]` or on a listener is a load-time error.
-- **`pins`** — SPKI pins, `sha256/<base64>`, the same spelling as
-  `curl --pinnedpubkey`. The upstream's end-entity public key must match one of
-  them **in addition** to whatever `mode` requires; a pin binds the peer to one
-  key, which no CA and no name can be substituted for. Pins are the only
-  assurance left under `mode = "none"`, so a pinned `none` is reported as
-  information while an unpinned one is a warning. Written as a whole list: a
-  deeper scope *replaces* the inherited set rather than adding to it.
-
-```toml
-    [listener.route.verify]
-    mode = "none"
-    pins = ["sha256/YLh1dUR9y6Kja30RrAn7JKnbQG/uEtLMkBgFF2Fuihg="]
-```
-
-Get a pin the same way curl documents it:
-
-```sh
-openssl s_client -connect host:443 -servername host </dev/null 2>/dev/null \
-  | openssl x509 -pubkey -noout \
-  | openssl pkey -pubin -outform der \
-  | openssl dgst -sha256 -binary | base64
-```
-
-### Private CAs
-
-`ca_file` adds trust anchors from a PEM bundle, and `trust_webpki = false`
-narrows trust to *only* those anchors (it therefore requires a `ca_file`).
-
-```toml
-    [listener.route.verify]
-    ca_file = "corp-root.pem"
-    trust_webpki = false
-```
-
-### Where it can be written
-
-`[verify]` inherits field-by-field along the usual ladder (see [Hierarchical
-configuration](#hierarchical-configuration)), and also applies to the two other
-places this gateway performs a TLS handshake of its own:
-
-| scope                     | applies to                                        |
-|---------------------------|---------------------------------------------------|
-| `[global.verify]`         | every TLS upstream in the document                |
-| `[listener.verify]`       | that listener's routes                            |
-| `[templates.<n>.verify]`  | whatever `use`s the template                      |
-| `[listener.route.verify]` | one route — deepest scope, wins over all above    |
-| `[resolvers.<n>.verify]`  | that resolver's own DoH/DoT endpoint certificate  |
-| `[pools.<n>.probe.verify]`| that pool's `tls` / `https://` probe              |
-
-A resolver's and a pool probe's blocks inherit from `[global.verify]` only; they
-are top-level objects with no listener or route above them. A pool probe is
-verified **separately from the routes that use the pool** — the probe measures
-its own connection, so weakening a route does not weaken its pool's probing, and
-a probe against an edge that answers an unmatched name needs its own `[verify]`.
-
-Anything the active configuration cannot act on is refused by name at load time
-rather than ignored: `[verify]` on an `http` or `raw` route (neither verifies a
-certificate — a `raw` stream is spliced untouched, so the *client* sees the
-upstream's certificate), on a plain-DNS resolver, or on a `tcp`/cleartext probe;
-`name` with a mode that checks no name; `ca_file` or `trust_webpki` with
-`mode = "none"`, which builds no chain at all.
-
-### What a weakened policy does to mirrored coverage
-
-Nothing is switched off, but the policy becomes part of the route's
-[certificate scope](#certificate-scopes). Mirroring keeps working in every mode
-— a route under `mode = "none"` still learns its upstream's coverage and still
-gets connection coalescing — and what changes is *who it is shared with*: only
-names held to the **same** policy against the **same** destination. So coverage
-learned from an unauthenticated peer can never reach a certificate that a fully
-verified route serves, and a client can never coalesce a strictly verified name
-onto a connection whose far end was never checked.
-
-Editing a `[verify]` block therefore moves the partition: the route starts a new
-`certs/<scope>/` directory and re-learns coverage under the policy now in force,
-rather than re-serving what it learned under the old one.
-
-Every scope that resolves a weakened policy says so at startup, `INFO` when a
-real assurance remains and `WARN` when none does:
-
-```
-WARN upstream certificate names are NOT checked: any certificate a public CA has
-     issued for any name is accepted here [...] scope="route web" policy=chain
-```
-
-## Certificate coverage
-
-How much a certificate covers is **not configurable**. Guessing it is what breaks
-HTTP/2: a certificate broader than the upstream's own authorizes the browser to
-coalesce requests the upstream will answer with `403`. Coverage is therefore
-**mirrored from the upstream's real certificate**, never proposed by this gateway.
-
-**Exact first.** The first connection for a host whose upstream has never been
-observed is answered with a certificate for that one name — no wildcard. Nothing
-can coalesce onto it, so no request can arrive that the upstream has not vouched
-for.
-
-**Then mirror what the upstream presented.** When a TLS-terminating route hands
-the connection to a TLS/ECH upstream, the upstream's leaf is read as part of the
-handshake that was happening anyway — no extra probe, no blocking — and its DNS
-SANs become this gateway's coverage for that host. If `edge.example.net` answers
-a handshake for `origin.example` with `{origin.example, mzz.origin.example}`,
-that is exactly what the client is served, so `t4.origin.example` cannot
-coalesce onto it. If the same upstream answers a handshake for
-`t4.origin.example` with `{origin.example, *.origin.example}`, that connection
-does carry the wildcard — coalescing is preserved precisely where the upstream
-accepts it.
-
-Observed SANs are keyed by the **requested** name, so a set learned for
-`t4.origin.example` is never served to a client asking for `origin.example`.
-
-**Rotation is handled by comparing every handshake.** The raw observed set is
-stored alongside the certificate. When a later handshake presents a different set
-— including a *narrower* one, which is the case that reintroduces `403` if ignored
-— the cached leaf is invalidated and re-signed against the new set.
-
-**Clipping.** A mirrored name is dropped when the upstream vouches for it but this
-listener would route it elsewhere (see [Certificate
-scopes](#certificate-scopes)), or when it is a wildcard directly above a public
-suffix (`*.com`, `*.co.uk`) — no real upstream needs one, and honoring it would
-hand out a certificate for an entire registry. The public-suffix list's **ICANN
-section only** decides that: `co.uk` and `co.jp` are boundaries, while
-private-section entries (`github.io`, `withgoogle.com`) are ordinary domains, so a
-genuine `*.withgoogle.com` from an upstream is mirrored. Dropped names are logged
-with the reason. If clipping removes everything, the exact name is served.
-
-Certificates are persisted per `(scope, host)` as `certs/<scope>/<host>.crt`
-together with the observed set that produced them, so a restart resumes mirroring
-instead of re-learning it. There is nothing to migrate and no mode to switch: a
-leaf that does not match what the upstream currently presents is simply re-issued.
-
-## Certificate scopes
-
-A browser may reuse ("coalesce") an existing HTTP/2 connection for a **second**
-origin when both of these hold ([RFC 9113 §9.1.1]):
-
-1. the second origin resolves to an address already in that connection's set, and
-2. the certificate on that connection is valid for the second origin.
-
-A coalesced request travels on the **existing** connection: no new TCP, no new TLS
-handshake, and therefore **no new SNI**. sni-gate routes per connection, at
-handshake time, from the SNI — so it never sees the second name and cannot
-re-route it. The request is delivered to whatever upstream that connection was
-already wired to.
-
-Every name pointed at this gateway shares its address, so condition 1 always
-holds here and condition 2 is the only one sni-gate controls. Hence the invariant:
-
-> A certificate served on a connection routed to some destination is never valid
-> for a name this listener would route to a **different** destination.
-
-Two mechanisms hold it, and both are load-bearing:
-
-- **Clipping.** Each proposed name is checked against this listener's routing
-  table and dropped unless *every* host it would cover routes into the same scope.
-  A wildcard is refused when a sibling is pinned elsewhere, when subdomains fall
-  through to a `default_route` in another scope, when they would match no route at
-  all, or when a regex route in another scope declares a `scope_suffix` that
-  overlaps with the wildcard. The requesting host itself is always covered, so a
-  clipped certificate is still usable.
-- **Partitioning.** The certificate cache and the on-disk store are keyed by
-  scope. Clipping alone would not survive accumulation: a later host under the
-  same anchor but a different destination would otherwise be merged into the
-  existing certificate, re-widening it after the fact.
-
-A **scope** is a set of names that may share a certificate. Two routes share one
-when they forward identically *and* are matched by the same routing table:
-
-- **Forwarding target** — route type, dial host (or the reflecting marker), port,
-  `override_sni` policy, `address_family`, `nat64_prefix`, `addr_resolver`, the
-  ECH config source, and the [`[verify]` policy](#upstream-certificate-verification).
-  Everything that decides where a connection goes, under what name it is
-  presented, and what the far end had to prove. Settings that can change none of
-  those three (timeouts, `fail`, the HTTP/2 switch, `ech_refresh`) are excluded:
-  they would fragment scopes without buying safety.
-- **Routing table** — a fingerprint of the listener's routes. A wildcard proven
-  confined under one listener's routes may not be confined under another's, so a
-  proof is only ever reused where it still holds. Listeners with identical route
-  tables (the usual `0.0.0.0:443` + `[::]:443` pair) therefore still share
-  certificates.
-
-Certificates are persisted as `certs/<scope>/<registrable>.crt` (plus `.key`).
-The scope directory is what stops two destinations from overwriting each other's
-file — without it, a reload would serve one certificate to both routes and
-re-widen coverage.
-
-Names **within** one scope may share a mirrored wildcard, so a client can still
-coalesce between them. That is deliberate: the upstream's own certificate already
-permits it, and the request reaches the same configured destination, which
-demultiplexes on `:authority` as any origin does. Nothing needs to be turned off
-to stay safe — a host whose upstream has not been observed is served an exact
-certificate, and an upstream that never presents a wildcard never yields one.
-
-Because the verification policy is part of the scope, "the same destination" also
-means "proven the same way". A route that verifies less keeps mirroring; it
-simply shares what it learned with fewer names.
-
-Every mirroring decision is logged at `INFO`, including each name clipping
-dropped:
-
-```
-mirrored upstream certificate coverage (clipped to this route scope)
-  scope=ech_edge.example.net_443-1f3a9c07b2d45e18 host=t4.example.com
-  sans=["t4.example.com", "example.com"] dropped=["*.example.com"]
-```
-
-That is a report, not a failure — routing is unaffected. It means the routing
-table sends two names under one registrable domain to different upstreams. To
-widen coverage, give the conflicting hosts the same upstream or move them under a
-different registrable domain.
-
-**One case this cannot reach:** a `raw` route never terminates TLS, so the client
-sees the **upstream's own** certificate and sni-gate cannot narrow it. If that
-certificate covers a name routed elsewhere on the same listener, a client may
-coalesce onto the raw connection and escape routing. sni-gate detects the shape —
-a `raw` route sharing a registrable domain with terminating routes — and warns at
-startup; it cannot fix it. Give such a route its own registrable domain, or use a
-terminating type.
-
-[RFC 9113 §9.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-9.1.1
-
-## Hierarchical configuration
-
-Overridable settings resolve from the most specific scope outward, with each
-scope's optional template sitting just below that scope's own explicit values:
-
-```
-route (explicit)  →  route's template  →  listener (explicit)  →
-listener's template  →  global
-```
-
-An unset value at a deeper scope inherits the next one out. This applies to
-`resolver` / `ech_resolver` / `addr_resolver`, `nat64_prefix`, `address_family`,
-`ech_refresh`, `require_ech`, `connect_timeout`, `idle_timeout`, and the fail
-policy. So you can set, say, a different `addr_resolver` or `nat64_prefix` on a
-single route while everything else inherits the global value.
-
-The **`[http2]` block** inherits field-by-field along this same ladder, so
-`enabled` / `probe` / `probe_timeout` each resolve independently — see
-[HTTP/2](#http2).
-
-The **`[verify]` block** (see [Upstream certificate
-verification](#upstream-certificate-verification)) inherits the same way, so
-`mode` / `pins` / `ca_file` / `trust_webpki` each resolve independently and a
-route can relax one of them without restating the rest. Its `name` is the one
-exception: it resolves only from the route's own block and the template that
-route `use`s, because it describes a single upstream's certificate.
-
-The entire **`[ech]` block inherits field-by-field along the same ladder**:
-`mode`, `config`, `ech_domain`, `max_retries` (and `require_ech` / `ech_refresh`
-/ `ech_resolver`) each resolve independently. Put the shared parts in
-`[global.ech]` (or `[listener.ech]`) once and let each ECH route override only
-what differs — a route may even omit `[ech]` entirely and inherit the whole thing.
-
-## Templates
-
-A `[templates.<name>]` table is a reusable bundle of settings referenced by a
-single `use = "<name>"` on a `route`, `default_route`, or `listener`:
-
-```toml
-[templates.ech-edge]
-type = "ech"
-  [templates.ech-edge.ech]
-  mode = "doh"
-  ech_domain = "ech.example"
-
-[[listener]]
-addr = "0.0.0.0:443"
-  [[listener.route]]
-  match_sni = [".site-b.example", ".site-c.example"]
-  use = "ech-edge"
-  address_family = "ipv4"
-  nat64_prefix = "64:ff9b::"
-```
-
-A template may carry every reusable field — `type`, `upstream`, `override_sni`,
-the pinned `cert_file`/`key_file`, a whole `[ech]` block, `fail`, and all the
-overridable knobs — but not the route *identity* (`name`, `match_sni`). It sits
-in the ladder just below its scope's explicit values (see above), so a route's
-own setting always wins over its template. Each scope references at most one
-template, and templates cannot reference other templates (no nesting). An
-unknown template name is a load-time error. `upstream` in a template only
-applies when the template is used by a *route* (listeners have no upstream).
-
-## DNS resolvers
-
-### Quick reference: Inline resolver specs
-
-A resolver spec may appear at any scope and takes one of these forms:
-
-| Form                              | Meaning                         |
-|-----------------------------------|---------------------------------|
-| `system`                          | the OS resolver                 |
-| `https://host[:port]/dns-query`   | DoH                             |
-| `tls://host[:port]`               | DoT                             |
-| `udp://host[:port]` or `tcp://host[:port]` | plain DNS with hostname (requires bootstrap) |
-| `ip[:port]` (bare IP)             | plain DNS to an IP              |
-
-`resolver` is the generic default. `ech_resolver` overrides it for ECH
-HTTPS-record lookups; `addr_resolver` overrides it for upstream A/AAAA. Each is
-independently overridable per scope.
-
-### Named resolvers: `[resolvers.<name>]`
-
-**Named resolvers** let you declare DNS resolvers as first-class configuration
-entities with full transport control, including bootstrap chains, upstream
-overrides, and ECH-on-ECH protection. Reference them by name anywhere a resolver
-spec is accepted.
-
-#### Why named resolvers?
-
-1. **Bootstrap chains** — When the resolver endpoint itself is blocked or
-   requires circumvention, resolve its hostname through a different resolver:
-   ```toml
-   [resolvers.bootstrap]
-   endpoint = "1.1.1.1"
-   
-   [resolvers.primary]
-   endpoint = "https://dns.blocked.example/dns-query"
-   bootstrap = "@bootstrap"  # Resolve dns.blocked.example via bootstrap
-   ```
-
-2. **Upstream override (CDN fronting)** — Dial a CDN edge while presenting the
-   real resolver's TLS server name:
-   ```toml
-   [resolvers.fronted]
-   endpoint = "https://dns.blocked.example/dns-query"
-   upstream = "cdn-edge.cloudfront.net"
-   # Dials cdn-edge.cloudfront.net, but TLS SNI remains dns.blocked.example
-   ```
-
-3. **ECH-on-ECH** — Protect the resolver's own TLS handshake with Encrypted
-   Client Hello:
-   ```toml
-   [resolvers.secure]
-   endpoint = "https://doh.example/dns-query"
-   bootstrap = "@bootstrap"
-     [resolvers.secure.ech]
-     mode = "doh"
-     require_ech = true
-   ```
-
-#### Configuration reference
-
-```toml
-[resolvers.<name>]
-endpoint = "..."           # Required: transport spec (see formats below)
-upstream = "..."           # Optional: override dial target (host, port, or both)
-override_sni = "..."       # Optional: TLS server name (omit=reflect, "name"=fixed, ""=suppress)
-bootstrap = "..."          # Optional: @resolver-name or inline spec for endpoint resolution
-address_family = "..."     # Optional: dual/ipv4/ipv6 (inherits from [global])
-nat64_prefix = "..."       # Optional: e.g. "64:ff9b::/96" (inherits from [global])
-connect_timeout = "..."    # Optional: per-query timeout (inherits from [global])
-
-[resolvers.<name>.ech]     # Optional: ECH for this resolver's handshake
-mode = "doh"               # or "static", "doh-with-fallback"
-config = "<base64>"        # Required for static/fallback modes
-ech_domain = "..."         # Override HTTPS lookup name
-require_ech = true         # Fail rather than GREASE (default: true)
-max_retries = 2            # ECH rejection retry budget
-ech_refresh = "1h"         # Proactive rotation interval
-ech_resolver = "..."       # @resolver-name or inline spec for ECH config fetch
-```
-
-#### Endpoint formats
-
-- `system` or `""` — OS resolver (default bootstrap)
-- `https://host[:port][/path]` — DNS-over-HTTPS (default port 443, path `/dns-query`)
-- `tls://host[:port]` — DNS-over-TLS (default port 853)
-- `udp://hostname:port` or `tcp://hostname:port` — Plain DNS with hostname (resolved via bootstrap)
-- `ip[:port]` — Plain DNS to literal IP address (default port 53, no bootstrap needed)
-
-**Note:** Bare words (without prefix) must be IP addresses to avoid collision with
-resolver references. Use `udp://` or `tcp://` prefix to specify a hostname.
-
-#### Using named resolvers
-
-Reference by name with `@` prefix anywhere a resolver spec is accepted:
-
-```toml
-[global]
-resolver = "@my-doh"          # Default for everything
-addr_resolver = "@fast"       # Override for A/AAAA lookups
-ech_resolver = "@secure"      # Override for HTTPS/ECH lookups
-
-[resolvers.my-doh]
-endpoint = "https://1.1.1.1/dns-query"
-
-[resolvers.fast]
-endpoint = "1.1.1.1"
-address_family = "ipv4"
-
-[resolvers.secure]
-endpoint = "https://dns.google/dns-query"
-```
-
-**Fallback order:**
-- `addr_resolver` → `resolver` → system
-- `ech_resolver` → `addr_resolver` → `resolver` → system
-
-#### Inheritance rules
-
-| Setting | Inherits from `[global]` | Notes |
-|---------|--------------------------|-------|
-| `address_family` | ✅ Yes | IP version preference |
-| `nat64_prefix` | ✅ Yes | IPv6 synthesis |
-| `connect_timeout` | ✅ Yes | Per-query timeout |
-| `[ech]` fields | ✅ Yes (field-by-field) | Only if `[ech]` block declared |
-| `[ech]` presence | ❌ No | Must opt-in explicitly |
-| `bootstrap` | ❌ No | Dependency edge, never inherited |
-| `ech_resolver` | ❌ No | Dependency edge, never inherited |
-
-**Dependency edges** (`bootstrap`, `ech_resolver`) are never inherited to prevent
-implicit cycles. The `[ech]` block itself must be explicitly declared, but its
-fields then inherit from `[global.ech]` field-by-field.
-
-#### Validation
-
-Named resolvers are validated at load time:
-
-- **Cycle detection**: `a → b → a` dependency cycles are rejected
-- **Unknown references**: `bootstrap = "@typo"` when no such resolver exists
-- **Self-bootstrap**: `bootstrap = "@self"` is rejected
-
-#### Advanced example: Multi-layer bootstrap chain
-
-```toml
-[global]
-resolver = "@layer-3"
-
-# Layer 1: IP-addressed, no dependencies
-[resolvers.layer-1]
-endpoint = "1.1.1.1"
-
-# Layer 2: First DoH hop
-[resolvers.layer-2]
-endpoint = "https://doh-a.example/dns-query"
-bootstrap = "@layer-1"
-
-# Layer 3: Final resolver with ECH
-[resolvers.layer-3]
-endpoint = "https://doh-b.example/dns-query"
-bootstrap = "@layer-2"
-  [resolvers.layer-3.ech]
-  mode = "doh"
-  require_ech = true
-  ech_resolver = "@layer-2"  # layer-2 fetches layer-3's ECH config
-```
-
-#### ECH rotation mechanism
-
-Named resolvers with ECH support automatic key rotation:
-
-**Reactive (on rejection):**
-1. Query fails with ECH rejection error
-2. Resolver detects the error pattern
-3. Re-resolves dial address through bootstrap
-4. Fetches fresh ECHConfigList via `ech_resolver`
-5. Builds new resolver with new config
-6. Atomically swaps the resolver
-7. Retries the query (up to `max_retries`)
-
-**Proactive (on timer):**
-1. Timer fires every `ech_refresh` interval
-2. Re-runs full build plan
-3. Byte-compares new ECHConfigList against current
-4. If unchanged: no-op (keeps existing resolver)
-5. If changed: atomic swap to new resolver
-
-Concurrent rebuilds are idempotent via generation counters.
-
-## Upstream address family & NAT64
-
-- `address_family = "dual"` (default) queries both families and, when both
-  answer, **races** the two addresses (RFC 8305 "Happy Eyeballs"): IPv6 is
-  dialed first and IPv4 joins it 250 ms later, with the first connection to
-  complete carrying the traffic. A published AAAA record says the *destination*
-  has IPv6, not that this host can route to it, so a dual-stack upstream stays
-  reachable when the local IPv6 path is broken — including the usual case where
-  the path silently drops packets instead of returning an error. The route's
-  `connect_timeout` bounds the race as a whole, not each attempt.
-  `"ipv4"` uses A only; `"ipv6"` uses AAAA only, and neither races.
-- `nat64_prefix` (a /96 prefix such as `64:ff9b::` or `2a01:4f8:c2c:123f:64:5`)
-  synthesizes an IPv6 target from a resolved IPv4 (RFC 6052). NAT64 is applied
-  in `dual`/`ipv4` when only an A record is available; it is **disabled** in
-  `ipv6` mode. You can also write a literal IPv6 upstream in bracket form,
-  e.g. `upstream = "[2a01:4f8:c2c:123f:64:5:203:405]:443"`.
-  A prefix also **turns the race off**: it declares a v6-only host, so a
-  synthesized address is another IPv6 address over the same stack rather than a
-  second path, and the raw IPv4 it came from is unroutable there. In `dual` with
-  a prefix set, an AAAA answer therefore ends the lookup and no A query is sent.
-
-## Upstream pools
-
-A **pool** is a set of endpoints that all serve the same role. sni-gate probes
-them in the background and routes each connection to the lowest-RTT healthy one,
-failing over when it degrades and recovering without intervention. Reference one
-with an `@` prefix, exactly like a named resolver or regex:
-
-```toml
-[pools.cf]
-targets = ["cf.example.com", "104.16.0.0/12[4]", "172.64.0.0/13[4]"]
-fallback = 0
-
-[pools.cf.probe]
-mode = "http"
-url = "https://cloudflare.com/cdn-cgi/trace"
-expect_status = [200]
-
-[[listener.route]]
-type = "ech"
-match_sni = [".x.com"]
-upstream = "@cf"
-select = ["ipv4"]
-```
-
-### Targets and candidates
-
-Two layers, and the distinction is what makes every index unambiguous:
-
-- A **target** is one `targets` entry. It has a stable zero-based index, and that
-  index is the *only* addressing unit in the config — `fallback`, `nat64.from`
-  and `select` all name targets.
-- A **candidate** is one probed address. One target yields several: a domain
-  yields one per A/AAAA record, a CIDR one per sampled address, and the NAT64
-  projection adds one per (IPv4 candidate × prefix).
-
-Tags belong to candidates, because that is where they are knowable: whether a
-domain contributes an `ipv4` or an `ipv6` endpoint is a fact about its DNS answer.
-So an integer in `select` matches a **target** (selecting all its candidates)
-while a string matches a **candidate tag**. For the same reason, indices are
-bounds-checked at load time but tags are not — an unmatched tag simply yields no
-candidates, and cannot be told apart at load from one that will match once DNS
-answers.
-
-| Target form | Type | Yields |
-|---|---|---|
-| `"cf.example.com"` | domain | one candidate per A/AAAA record |
-| `"1.2.3.4"`, `"2606:4700::1"` | literal | one candidate |
-| `"104.16.0.0/12[4]"` | CIDR, sampled | 4 candidates |
-| `{ addr = "...", tags = ["edge"] }` | any of the above | custom tags appended |
-
-`[N]` draws N random addresses. Omitting it expands the range and is **refused
-above 64 addresses** — a `/12` holds a million. Samples are drawn once at startup
-so RTT measurements survive; a sample that never answers is eventually replaced.
-
-### Probing
-
-| Mode | Tests | RTT measured to | Takes |
-|---|---|---|---|
-| `tcp` | TCP connect | connect completion | `port` |
-| `tls` | + TLS handshake | handshake completion | `port`, **`sni`**, `[ech]` |
-| `http` | + HTTP GET | first response byte | **`url`**, **`expect_status`**, `[ech]` |
-
-Bold fields are required. Every mode also takes `timeout`, `interval`,
-`degraded_interval` and `fail_threshold`.
-
-A field a mode cannot act on is **rejected, not ignored** — `expect_status` on a
-`tls` probe would otherwise leave you believing the response is checked when the
-probe stops at the handshake.
-
-An `http` probe has no `sni` or `port` of its own: the `url` already carries the
-scheme, host, port and path, so there is one place to look and no way for them to
-disagree. RTT stops at the first response byte, so a large body never inflates
-the measurement.
-
-`sni` and `port` belong to the **pool**, not to any consuming route: the probe
-measures link quality to an edge node, not the response for one specific host. A
-route then applies its own port to the address the pool chose, which is why
-`upstream = "@cf:8443"` needs no second pool.
-
-| Field | Default | Meaning |
-|---|---|---|
-| `port` | `443` | probed port (`tcp` / `tls`; `http` takes it from the URL) |
-| `timeout` | `3s`, `5s` for `http` | per-candidate deadline |
-| `interval` | `5m` | cycle for a healthy candidate |
-| `degraded_interval` | `30s` | **first** retry delay, doubling up to `interval` |
-| `fail_threshold` | `2` | consecutive failures before degradation |
-
-#### Probing behind ECH
-
-A `tls` or `https://` probe can hide its own SNI, using the same `[ech]` block
-routes and resolvers use:
-
-```toml
-[pools.cf.probe.ech]
-mode = "doh"                          # static | doh | doh-with-fallback
-ech_domain = "crypto.cloudflare.com"  # HTTPS record queried for `ech=`
-ech_resolver = "@cloudflare"          # default: the pool's own resolver
-```
-
-Its fields inherit from `[global.ech]` field-by-field, but its **presence never
-does** — exactly as for a resolver, so a `[global.ech]` written for your routes
-will not silently start hiding every probe. `ech_resolver` is a dependency edge
-and is never inherited either.
-
-The ECHConfigList is fetched once per probe SNI and refreshed on the HTTPS
-record's own TTL (bounded by `ech_refresh`, default `1h`), never per probe. If
-the server rejects ECH because its published key rotated, the probe refetches and
-retries up to `max_retries` (default `2`). `require_ech` defaults to `true`; set
-to `false` and a probe with no published ECHConfig falls back to GREASE, which
-sends the SNI in the clear.
-
-### How selection stays stable
-
-- **RTT is a moving average**, not the last sample, so one unlucky measurement
-  never hands the top of the ranking to a worse endpoint.
-- **Switching requires a margin** of 20% or 5ms, whichever is larger. Two
-  endpoints a millisecond apart would otherwise trade places every cycle, moving
-  traffic for no gain and invalidating the mirrored-certificate cache each time.
-- **Backoff is per-candidate and exponential.** Sampling a CIDR routinely draws
-  an address nothing answers on; a single pool-wide "degraded cadence" would let
-  one dead candidate pin the whole pool to the fast cycle forever.
-- **The data path never probes.** `select` is resolved when routes are built, so
-  serving a connection is one lock-free read of a published ranking — no
-  filtering, no DNS, no I/O. A traffic burst cannot become a probe burst.
-
-### Adaptive throughput-aware routing
-
-By default, pools rank by **RTT alone** — lowest round-trip time wins. This works
-well for latency-sensitive workloads (APIs, small requests), but for large
-transfers (images, videos, downloads), **throughput matters more than handshake
-latency**.
-
-Enable composite `rtt + payload/throughput` scoring to let the pool learn which
-candidates are fast for bulk transfers:
-
-```toml
-[pools.cdn.probe]
-score_payload_bytes = 1_000_000  # 1 MB reference payload
-```
-
-The gateway learns throughput from completed connections and uses **Thompson
-Sampling** to balance routing to known-good candidates (exploitation) with
-discovering better alternatives (exploration). Candidates with uncertain
-throughput occasionally draw optimistic samples and get traffic. Each connection
-samples every eligible candidate once; feedback is consumed independently of
-active-probe scheduling. Learning depends on the traffic actually observed.
-
-**Hierarchical priors:** Candidates are grouped by `/24` (IPv4) or `/48` (IPv6)
-subnet. Observations on one candidate improve the initial estimate for siblings
-in the same subnet, accelerating learning in large pools.
-
-**Default:** `score_payload_bytes = 0` is pure RTT ranking and disables transfer
-telemetry. RTT smoothing uses Kalman, so exact rankings can differ from the earlier
-EWMA estimator. Set it to your typical transfer size (100 KB
-for images, 10 MB for video) to enable adaptive routing.
-
-### NAT64 projection
-
-```toml
-[pools.cf.nat64]
-prefixes = ["64:ff9b::"]
-from = [1, 2]        # target indices; omit for all
-timeout = "8s"       # optional: NAT64 carries an extra hop
-```
-
-Not a separate pool — an address-family projection of the same one. Synthesized
-addresses are tagged `nat64` + `ipv6` and ranked **independently** of their IPv4
-originals, since a slow NAT64 gateway says nothing about the native path.
-
-### Fallback
-
-`fallback` is a target index, used before anything is healthy and whenever
-everything matching a consumer's `select` is degraded, then retired the moment one
-recovers. It is drawn under the consumer's own filter, so a `select = ["nat64"]`
-route falls back to a synthesized address rather than a bare IPv4 its host may not
-be able to reach.
-
-With no fallback and nothing healthy, the route's `fail` policy applies. A pool
-never invents a destination.
-
-### What a pool takes over
-
-A pool resolves its own targets, so `address_family`, `nat64_prefix` and
-`addr_resolver` are **rejected** on a route whose upstream is a pool — set them on
-the pool (which has its own `resolver`) instead. Values merely *inherited* from a
-broader scope are ignored rather than an error, so a global default stays usable.
-`select` is likewise rejected on a non-pool upstream, where it would silently do
-nothing.
-
-Two consequences worth knowing:
-
-- **The h2c probe is skipped** for pool upstreams. A pool has no settled address
-  at startup and its choice changes afterwards, so validating one candidate would
-  attest to something the data path may never dial.
-- **`tls`/`ech` routes need a name.** A pool selects an address, and no hostname
-  describes it, so the upstream certificate is verified against the route's SNI
-  (`override_sni`, or the reflected inbound name). If neither exists the
-  connection is refused with an error naming `override_sni` — verification is
-  never skipped.
-
-## ECH
-
-For `type = "ech"` routes, the ECHConfigList is sourced by an `[ech]` block. Its
-fields inherit field-by-field from `[listener.ech]` and `[global.ech]` (and any
-template), so shared settings need to be written only once; a route's `[ech]`
-overrides only what differs, and may be omitted entirely when the enclosing
-scopes already provide a complete config:
-- `mode = "static"` — a fixed inline base64 `config`.
-- `mode = "doh"` — looked up in the HTTPS record of `ech_domain` (or the inner
-  name) via the ECH resolver; refreshed on `ech_refresh` / the record TTL.
-- `mode = "doh-with-fallback"` — DoH, falling back to the inline `config`.
-
-An omitted `mode` inherits (it is *not* silently `doh`); `static` and
-`doh-with-fallback` require a `config` to be resolvable from some scope, checked
-at load time. The upstream certificate is verified against the **inner (true) name** using the
-web-PKI roots. `require_ech` (default true) fails closed unless ECH is
-negotiated. **ECH retry**: if the server rejects ECH (its key rotated), the
-cached config is invalidated, a fresh one is fetched, and the handshake is
-retried up to `max_retries` times before the fail policy applies.
-
-## HTTP/2
-
-HTTP/2 is opt-in per route via an inheriting `[http2]` block:
-
-```toml
-[global.http2]
-enabled = false        # opt-in
-probe = "warn"         # off | warn | require   (http routes only)
-probe_timeout = "3s"
-
-[[listener.route]]
-type = "http"
-match_sni = [".web.example"]
-upstream = "127.0.0.1:8080"
-  [listener.route.http2]
-  enabled = true
-```
-
-**Inbound and upstream always speak the same protocol.** sni-gate splices bytes
-rather than parsing HTTP, so it cannot translate between framings: there is no
-"HTTP/2 in, HTTP/1.1 out" mode. `enabled` is a single coupled switch. (Doing
-otherwise would mean reassembling requests, remapping streams and handling
-trailers, upgrades and CONNECT — a different program.) In exchange, the data path
-stays a transparent byte pump, so WebSockets and other upgrades keep working.
-
-How the protocol is chosen depends on whether the upstream speaks ALPN:
-
-- **`tls` / `ech` — ALPN mirroring.** The upstream is dialed *first*, offering
-  the intersection of what the client offered and what sni-gate can carry
-  (`h2`, `http/1.1`). Whatever the upstream selects is then advertised verbatim
-  on the inbound handshake. A mismatch is structurally impossible, and an
-  upstream that only does HTTP/1.1 transparently downgrades that connection —
-  decided per connection against the live upstream, never from a cached guess.
-  Note this dials the upstream slightly earlier in the connection's life than a
-  non-HTTP/2 route does.
-- **`http` — the client decides.** The upstream is cleartext and has no ALPN to
-  mirror, so `[h2, http/1.1]` is offered inbound (h2 preferred). If the client
-  picks h2, the decrypted bytes are spliced to the backend as **prior-knowledge
-  h2c** (RFC 9113 §3.4), which is byte-identical to h2 over TLS. The backend must
-  therefore be configured for h2c.
-- **`raw`** never terminates TLS, so there is no ALPN to negotiate. Enabling
-  `http2` on a `raw` route is a load-time error; a value merely *inherited* from
-  a broader scope is ignored, so a global `enabled = true` coexists fine with
-  `raw` routes.
-
-### The h2c probe
-
-Because nothing in the `http` data path can discover that a backend only speaks
-HTTP/1.1, that one case is checked at startup: sni-gate opens a connection,
-sends the HTTP/2 preface, and expects a `SETTINGS` frame back.
-
-The probe **validates; it never decides.** No mode silently downgrades a route to
-HTTP/1.1 — a probe result goes stale the moment the backend is reconfigured (an
-`nginx reload` that drops `http2 on` would leave a cached verdict quietly wrong),
-and a silent downgrade would hide exactly the misconfiguration this exists to
-surface.
-
-| `probe`   | On failure                                                        |
-|-----------|-------------------------------------------------------------------|
-| `off`     | no probe                                                          |
-| `warn`    | log loudly, keep HTTP/2 enabled as configured *(default)*         |
-| `require` | fail startup                                                      |
-
-`warn` is the default so that a backend which merely has not started yet cannot
-stop the gateway from booting. Backends are deduplicated, probed concurrently,
-and each *attempt* is bounded by `probe_timeout`. A backend that resolved in
-both address families is probed on the second only if the first could not be
-reached — the data path races both, so condemning a route over one unreachable
-family would be a verdict it never actually earns — which makes `2 ×
-probe_timeout` the worst case for such a backend. Routes that reflect the
-source SNI/Host have no fixed upstream at startup and are skipped.
-
-Cleartext (non-TLS) inbound connections cannot use HTTP/2: a prior-knowledge h2c
-request carries its `:authority` in HPACK-compressed HEADERS, which cannot be
-read without decoder state, so there is no routing key. Such connections carry no
-key and fall through to `default_route`.
-
-## Download
-
-Each release publishes prebuilt binaries for the major platforms. Linux and
-Windows come in two flavors:
-
-- **static** (`*-linux-static`, `*-windows-static.exe`) — no runtime
-  dependencies; runs on any Linux (musl) or Windows without the VC++
-  redistributable. Best for portability and containers.
-- **dynamic** (`*-linux`, `*-windows.exe`) — smaller; links the platform's
-  libc / CRT.
-
-macOS ships a single (dynamic) binary per architecture, as libSystem cannot be
-linked statically on that platform. `SHA256SUMS` accompanies every release.
-
-## Build
-
-Requires a stable Rust toolchain and (on Windows) NASM + a C toolchain for the
-aws-lc-rs dependency, which provides the HPKE suites ECH needs.
+## 30 秒跑起来
 
 ```sh
 cargo build --release
-# or, reproducible & privacy-hardened (strips symbols, remaps build paths):
-./build-release.sh
+cp sni-gate.example.toml sni-gate.toml      # 然后编辑它
 
-# Fully static Linux build (no glibc dependency):
+sudo ./target/release/sni-gate --install-ca # 生成本地 CA 并装进系统信任库
+sudo ./target/release/sni-gate              # 读取 ./sni-gate.toml
+```
+
+- 换配置路径用 `-c <path>`。`--version` / `--help` 可用，**没有子命令**。
+- 绑 443/80 需要特权：Windows 管理员，macOS/Linux root。
+- 日志优先级：`SNI_GATE_LOG` → `RUST_LOG` → 配置里的 `global.log`（默认 `info`）。
+- 只想要产物：每个 release 附 **8 个目标**（Linux gnu/musl × x86_64/aarch64、Windows MSVC 动态+静态、macOS aarch64+x86_64）与 `SHA256SUMS`。Linux/Windows 的 `-static` 变体不依赖运行时。
+
+## 一条连接怎么走
+
+<p align="center">
+  <img src="./assets/readme/flow.svg" width="100%" alt="连接处理路径：peek 取键、路由优先级匹配、终止并现签证书、再按 ech/tls/http 重新发起，raw 不终止">
+</p>
+
+1. **peek**：只看不吃——不消费任何字节，取出路由键（TLS 的 `server_name`，或 HTTP 的 `Host`）。
+2. **route**：按优先级匹配，第一个命中即生效。
+3. **terminate + issue**：除 `raw` 外都终止入站 TLS，用本地 CA 为该名字签一张叶子证书，再按路由类型重新发起上游连接。`raw` 把未改动的 TCP 流直接拼过去。
+4. **没命中也没有 `default_route`** 时，执行全局 `unmatched` 策略。
+
+## 路由匹配：顺序即语义
+
+| 优先级 | 写法 | 含义 |
+|---|---|---|
+| 1 | `api.example.test` | 精确名 |
+| 2 | `*.example.test` | 通配，**只吃一层标签** |
+| 3 | `.example.test` | 后缀，任意深度 |
+| 4 | `@my_regex` | 命名正则，按**路由声明顺序**逐个尝试 |
+| 5 | `default_route` | 该监听器的兜底 |
+| 6 | `unmatched` | `"close"`（默认）· `"system-outbound"` · `{ mode = "passthrough", addr = "host:port" }` |
+
+- 主机名统一转小写并去掉尾部 `.`。
+- `match_sni` 里的正则**必须**先在 `[regexes.<name>]` 声明，并且**必须**带 `scope_suffix`（非空）；内联 `~...` 写法在加载期直接拒绝。
+- 监听地址三种写法：`"0.0.0.0:443"`、`"[::]:443"`、裸端口 `"443"`/`443`。裸端口只绑 **IPv4 通配**（与 nginx `listen 443` 同语义），要 IPv6 就再加一个 `"[::]:443"`。`"443"` 与 `"0.0.0.0:443"` 归一化成同一地址，同时写会在启动时报重复监听。不接受主机名。
+
+## 证书覆盖：不猜，只镜像
+
+<p align="center">
+  <img src="./assets/readme/coverage.svg" width="100%" alt="证书覆盖范围来自上游叶子证书的 SAN：先精确应答，再镜像上游 SAN，被裁掉的名字与保留的名字分别标注">
+</p>
+
+一张证书覆盖多少**不可配置**。之所以不让它可配，是因为「猜宽一点」会直接破坏 HTTP/2：比上游更宽的证书会授权浏览器把请求合并到上游不该答的路径上（表现为 `403`）。所以覆盖范围**永远由上游的真实证书决定**，不由本网关提议。唯一的例外是钉了 `cert_file`/`key_file` 的路由：覆盖范围就是你给的那张证书，既不镜像也不重签。
+
+- **先精确。** 上游从未被观测过的主机，首个连接只拿到那一个名字的证书，没有通配——没有东西能合并上来。
+- **再镜像。** **反射入站名字**的路由把连接交给 TLS/ECH 上游时，上游叶子证书在**本来就要发生的那次握手**里被读走（不额外探测、不阻塞），它的 DNS SAN 就成为该名字在这个网关上的覆盖范围。固定 `override_sni` 或钉了 `cert_file` 的路由不参与镜像——它们的覆盖由操作者决定。
+- **按请求的名字记账。** 为 `t4.origin.example` 学到的 SAN 集合，绝不会发给请求 `origin.example` 的客户端。
+- **轮换靠逐次比对。** 原始观测集合与证书一起存。后续握手若给出不同集合——**包括更窄的集合**（忽略它正是重新引入 `403` 的那条路）——缓存叶子即失效并按新集合重签。
+- **裁剪。** 三种情况会丢掉镜像来的名字：① 上游虽然背书、但这个监听器会把该名字路由到别处；② 它是**公共后缀正上方的通配**（`*.com`、`*.co.uk`）——判定只看公共后缀列表的 **ICANN 段**，`co.uk`、`co.jp` 是边界，而私有段条目（`github.io`、`withgoogle.com`）是普通域名，所以上游真给的 `*.withgoogle.com` 会被镜像；③ 它本来就**不可签发**：IP 字面量、畸形条目、或任何 TLS 客户端都不会认的多级通配。被丢掉的名字会进日志，但**只记名字、不记原因**。
+- **请求的名字一定在集合里。** 只要保留下来的名字没有覆盖到请求方本身（例如上游只给 `*.example.com`，而请求是 apex `example.com`），就把这个请求名补进 SAN——所以「全被裁光」和「幸存者碰不到它」走的是同一条路。
+- **持久化。** 证书按 `(scope, host)` 存成 `certs/<scope>/<host>.crt`，连同产生它的观测集合，重启后接着镜像而不是重新学。没有需要迁移的东西，也没有开关：与上游当前呈现不符的叶子会直接重签。
+
+## 上游池与自适应选路
+
+<p align="center">
+  <img src="./assets/readme/pools.svg" width="100%" alt="上游池：目标展开、后台探测、RTT 卡尔曼与 log 吞吐后验、每连接抽样、迟滞与在位者粘滞、NAT64 合成候选">
+</p>
+
+路由的 `upstream` 可以写成 `@pool_name`（或 `@pool_name:8443`），把选路交给一个**带后台探测的候选池**。
+
+- **targets**：IP、域名，或 CIDR。CIDR 要么用 `[N]` 显式采样（`"104.16.0.0/12[4]"` = 随机取 4 个地址），要么整段展开——但整段**上限 64 个地址**，超过就在加载期拒绝并提示补 `[N]`。可以给目标打 `tags`，路由侧用 `select` 按索引或标签取子集：多个条件是**并集**（命中任一即可，没有 AND 也没有取反），写成空列表则表示**不过滤**——用于把模板带来的过滤放宽回全部。
+- **probe**：`mode` 只能是 `tcp` / `tls` / `http`（**没有关闭探测这个选项**）。默认健康间隔 `interval = 300s`、降级间隔 `degraded_interval = 30s`、`fail_threshold = 2`、`max_concurrent_probes = 16`；`port` 默认 443，但**只对 `tcp`/`tls` 有意义**——`http` 模式下写 `port` 是加载期错误（端口在 URL 里）。RTT 依模式分别停在连上 / 握手完成 / 收到首个响应字节。
+- **两个估计器**：RTT 上是卡尔曼滤波（配单侧 CUSUM 抓突变）；吞吐上是 **log-吞吐的 Normal-Inverse-Gamma 后验**。吞吐观测值来自**被动完成的传输**，不是探测结果。
+- **每连接抽样**：对每个合格候选各抽一次它潜均值的精确 Student-t(2α) 边缘，分数 = 平滑 RTT（秒）+ `payload_bytes / 抽样吞吐`，取最优者拨号。
+- **稳定性**：发布顺序上做**成对迟滞**——挑战者必须比在位者快出「在位者分数的 20%」这个余量（余量下限 5 ms），不是「差距的 20%」。此外每条路由视图还有**在位者粘滞**，但它**只在吞吐模式下生效**：`score_payload_bytes = 0`（默认）时直接取排序首位，粘滞代码根本不跑。
+- **退避与保留**：探测失败的候选走**指数退避**；而**离开候选集合**的地址（域名记录轮换、被换掉的采样地址）其 Kalman/NIG 历史会 park 保留 600 s（固定常量，不可配），以便它回来时不必从零重学。
+- **兜底与投影**：`fallback` 是目标索引，**只在健康集合为空时**使用；没有任何健康候选且没有 fallback 时，`pick` 直接失败、这条路由不拨号。`[pools.<n>.nat64]` 的 `prefixes`（RFC 6052 /96）会为每个参与候选**合成额外的 IPv6 候选**（打上 `nat64` + `ipv6` 标签），独立探测、独立排序。/24（v4）与 /48（v6）的**子网先验**由被动吞吐观测喂出来、再传给新出现的地址——所以它同样**只在吞吐模式下才有内容**。
+
+三条必须说清的边界：
+
+1. `score_payload_bytes` 默认是 **0**，这会**同时关掉吞吐遥测通道与抽样路径**——连带在位者粘滞与子网先验一起不生效。默认形态就是「在带迟滞的排序上取首位、纯平滑 RTT 选路」。要用自适应吞吐，得显式打开它。
+2. **没有收敛或 no-regret 保证**。不确定度只会让排序更平滑，不做门控；探测成功/失败走的是独立的 `degraded` 标记，不进后验。
+3. 用池会**接管解析路径**：不再走 `lookup_addr`，也不做双栈地址族竞速。因此**写在路由或路由模板上**的 `address_family` / `nat64_prefix` / `addr_resolver` 与池型 upstream 并存会在加载期被拒；从更宽作用域**继承**来的这些值则保持无害（由池接管，不会被误读成配置冲突）。证书 scope 以 `pool={name}` 记账。resolver 不允许经由池拨号。
+
+## 分层配置与模板
+
+`route → listener → global` 逐层继承，几乎每个键都能在更窄的作用域里覆盖；`use = "template"` 复用一组设置，**模板不可嵌套**。所有结构体都是 `deny_unknown_fields`——键名写错是**启动失败**，不是静默忽略。
+
+## 上游证书校验
+
+`[verify] mode` 取 `"full"`（默认）· `"chain"` · `"none"`。另有两个更值得优先用的字段：`name`（固定校验名）与 `pins`——**SPKI 公钥钉住**，写法 `sha256/<base64>`（RFC 7469 §2.1.1，与 `curl --pinnedpubkey` 同形），并且是**叠加**在 `mode` 的要求之上而不是替代它；`pins` 整列表覆盖，深层作用域是**换掉**继承来的集合而不是追加。`ca_file` 可加私有 CA（`mode = "none"` 下无意义，因为不建链），`trust_webpki` 默认 `true`。
+
+任何弱化校验的配置都会在**启动时报告**。值得理解代价：客户端看到的仍然是这个网关的 CA 签出的证书，因此**客户端无法分辨远端有没有被检查过**。
+
+## ECH、HTTP/2、地址族
+
+- `[ech] mode = "doh" | "static" | "doh-with-fallback"`（默认 `doh`）、`require_ech` 默认 `true`、`max_retries` 默认 2、`ech_refresh` 默认 1h。
+- `override_sni` 三种写法语义不同：省略 = 透传入站名字；`"name"` = 固定名字；`""` = **不发 SNI 扩展**。空串与省略是刻意区分的：对以 IP 寻址、或只按自己发的证书做区分的上游有用；ECH 场景下 [RFC 9849 §5](https://www.rfc-editor.org/rfc/rfc9849.html#section-5) 明确允许 inner ClientHello 不带 `server_name`（外层的 ECHConfig 公共名照发）。抑制 SNI 改变的是**发出去什么**，不是**信任什么**——上游证书仍按该路由本来要发的名字校验。
+- `[http2] enabled` 默认 **false**。`probe = "off" | "warn" | "require"` 默认 `warn`：启动时探一次后端是否真说 h2c，但**探测只验证、不改判**——绝不会因为探测结果就悄悄把路由降级成 HTTP/1.1（那正好掩盖了需要被暴露的配置错误）。这个探测的适用范围很窄：只有 **`http` 路由 + `enabled` + `probe != off` + 上游是固定直连地址**才会探；池型上游（启动时还没 settled）与反射入站 SNI/Host 的路由（没有固定后端）会被跳过，并在 `debug` 日志里说明原因。`raw` 路由上显式开 `http2` 是加载期错误；从更宽作用域**继承**来的值会被忽略，所以全局 `enabled = true` 与 `raw` 路由可以共存。明文（非 TLS）入站连接**用不了** HTTP/2：prior-knowledge h2c 的 `:authority` 在 HPACK 压缩的 HEADERS 里，没有解码器状态就读不到，因此没有路由键，会落到 `default_route`。
+- `address_family = "dual" | "ipv4" | "ipv6"`（默认 `dual`）。双栈上游会**同时向两个地址族发起竞速**，先通者胜——不会因为某一族不可达就判整条路由死刑。`nat64_prefix` 在解析上游地址时做 IPv4→IPv6 替换（`address_family = "ipv6"` 下不生效）。
+- DNS 只作为**客户端**使用：`system` / `https://`（DoH）/ `tls://`（DoT）/ `udp://` / `tcp://`，可命名成 `[resolvers.<name>]` 并逐跳指定 ECH 与校验策略。
+
+## 运行边界（请务必读）
+
+- `ca/ca.key` 是**信任根私钥**，已 gitignore；对外只分发 `ca/ca.crt`。
+- 终止 TLS 意味着对这些路由类型而言，Himari 看得到明文。
+- **没有配置热重载**：改监听、路由、池、resolver 都要重启。唯一的热重载是 **PSL 文件**，而且要看条件：`[psl] auto_reload = true` **且** `source = "file"` **且**该文件此刻存在，watcher 才会起（文件缺失时只记一条 info，不会 arm）；`SIGHUP` 则是无条件只重载 PSL。
+- 它**不是**：HTTP/SOCKS5 正向代理（没有 CONNECT，`type = "http"` 是明文转发）；没有 GUI / 托盘 / Web 界面；不是 DNS 拦截器或 fake-IP 服务；监听器**不校验客户端证书**（无 mTLS 入站认证）。
+- 退出：Ctrl-C 或 SIGTERM。信号一到就停止接受新连接并以 **exit 0** 退出，但**不做连接排空**——在飞的拼接会被直接丢弃。另外信号处理器是在启动那段 `select` 里才装上的，所以**过早**发 TERM 会以「信号死亡」记账；外部控制器要等就绪再停，否则会把用户发起的停止误判成崩溃。
+
+## 构建
+
+```sh
+cargo build --release
+./build-release.sh        # 可复现 + 隐私加固：去符号、重映射构建路径
+
+# 完全静态的 Linux 产物（不依赖 glibc）
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
-# Fully static Windows CRT (like C's /MT):
+
+# 静态 Windows CRT（相当于 C 的 /MT）
 RUSTFLAGS="-Ctarget-feature=+crt-static" cargo build --release
 ```
 
-## Configure and run
+需要稳定版 Rust 工具链（`rust-version = 1.88`）；Windows 还需 NASM + C 工具链，因为 `aws-lc-rs` 提供 ECH 所需的 HPKE 套件。
+
+## 测试与 CI
+
+- **341 个测试函数**（`src/` 单元 + `tests/` 集成）。`tests/e2e.rs` 会拉起**真二进制**打真握手，覆盖：`raw` 字节直通、`http` 路由终止 TLS 并签证书、未观测上游只发 exact 证书、跨路由合并结构上不可能、模板端到端、h2 入站拼接 h2c 后端、关闭 http2 时仍协商 http/1.1。池与自适应选路另有 `tests/pool_e2e.rs`（含加载期拒绝的负例）与 `tests/pool_adaptive_e2e.rs`（在两次探测之间完成探索与学习）。
+- CI：`cargo fmt --all -- --check` + `cargo clippy --all-targets --locked -- -D warnings`；构建与全量测试跑在 Linux x86_64、Linux arm64、Windows x86_64、macOS(aarch64)，其中 macOS 那一腿是 soft（`continue-on-error`），避免 runner 容量抖动阻塞判定。
+
+## 配置参考
+
+[`sni-gate.example.toml`](sni-gate.example.toml) 覆盖绝大多数键，含各层默认值与互斥关系；但不是全部——`cert_file`/`key_file`、`idle_timeout`、`scope_suffix` 就没有出现在里面，这些要看 `src/config.rs` 的字段注释。
+
+## 许可证
+
+MIT 或 Apache-2.0 双许可（见 `LICENSE-MIT`、`LICENSE-APACHE`）。
+
+---
+
+<a id="english"></a>
+
+## What Himari is
+
+Himari is a **single-binary, multi-listener TLS gateway**. Each connection is routed by its TLS **SNI** (or the HTTP `Host`), and wherever it terminates TLS it **issues a certificate for that name on the fly** — signed by a local CA, unless the route pins its own with `cert_file`/`key_file`, in which case the CA is not involved. Upstreams are reached four ways: `ech`, `tls`, `http`, `raw`. Configuration is hierarchical (route → listener → global), so almost every setting can be pinned per route and otherwise inherits outward.
+
+> **On the name**: the Cargo package, the binary and the default config file still carry the upstream name `sni-gate` (`sni-gate.toml`, `SNI_GATE_LOG`). The commands below use the real artifact names; the project is Himari.
+
+Two capabilities are the reason it exists:
+
+- **Dynamic per-SNI issuance** — no per-site certificate maintenance. Any name gets a valid certificate the first time it is requested, from a CA you trust once. Coverage is not guessed: the first handshake is answered exactly, and wider coverage is mirrored from the upstream's own certificate. Issued certs are cached and persisted.
+- **ECH re-origination** — hide the true SNI from the path to a CDN edge, giving ECH to clients and environments that cannot do it themselves.
+
+## Run it in 30 seconds
 
 ```sh
-cp sni-gate.example.toml sni-gate.toml
-# edit sni-gate.toml
-sni-gate.exe               # loads ./sni-gate.toml
-sni-gate.exe -c <path>     # or an explicit path
+cargo build --release
+cp sni-gate.example.toml sni-gate.toml      # then edit it
+
+sudo ./target/release/sni-gate --install-ca # generate the local CA, trust it
+sudo ./target/release/sni-gate              # loads ./sni-gate.toml
 ```
 
-See [`sni-gate.example.toml`](sni-gate.example.toml) for every option.
+- `-c <path>` for another config path. `--version` / `--help` exist; there are **no subcommands**.
+- Binding 443/80 needs privilege: Administrator on Windows, root on macOS/Linux.
+- Log precedence: `SNI_GATE_LOG` → `RUST_LOG` → config `global.log` (default `info`).
+- Prebuilt: every release ships **8 targets** (Linux gnu/musl × x86_64/aarch64, Windows MSVC dynamic + static, macOS aarch64 + x86_64) with `SHA256SUMS`. The `-static` Linux/Windows builds need no runtime dependencies.
 
-## Trusting the CA
+## The path of one connection
 
-The CA is generated on first run at the `[ca]` paths. Import the **certificate**
-(never the key) into each device that should trust issued certs:
+1. **peek** — read without consuming any bytes to get the routing key (`server_name`, or `Host`).
+2. **route** — first match wins, in the order below.
+3. **terminate + issue** — for every type except `raw`, terminate inbound TLS with a leaf signed by the local CA, then re-originate per route type. `raw` splices the untouched TCP stream.
+4. **No match and no `default_route`** — the global `unmatched` policy applies.
+
+## Route matching: the order is the semantics
+
+| Rank | Form | Meaning |
+|---|---|---|
+| 1 | `api.example.test` | exact |
+| 2 | `*.example.test` | wildcard, **one label** |
+| 3 | `.example.test` | suffix, any depth |
+| 4 | `@my_regex` | named regex, tried in **route declaration order** |
+| 5 | `default_route` | this listener's fallback |
+| 6 | `unmatched` | `"close"` (default) · `"system-outbound"` · `{ mode = "passthrough", addr = "host:port" }` |
+
+- Hosts are lowercased and stripped of a trailing dot.
+- A regex in `match_sni` **must** be declared as `[regexes.<name>]` **and** carry a non-empty `scope_suffix`; inline `~...` is rejected at load time.
+- Listener `addr` accepts `"0.0.0.0:443"`, `"[::]:443"`, or a bare port `"443"` / `443`. A bare port binds the **IPv4 wildcard only** (nginx `listen 443` semantics) — add `"[::]:443"` for IPv6. `"443"` and `"0.0.0.0:443"` normalize to the same address, so writing both is a duplicate-listener error at startup. Hostnames are not accepted.
+
+## Certificate coverage: mirrored, never guessed
+
+How much a certificate covers is **not configurable**, because guessing wide is exactly what breaks HTTP/2: a certificate broader than the upstream's authorizes the browser to coalesce requests the upstream answers with `403`. Coverage is therefore **mirrored from the upstream's real certificate**, never proposed by this gateway. The one exception is a route that pins a `cert_file`/`key_file` pair: its coverage is whatever that certificate says, and nothing is mirrored or re-signed.
+
+- **Exact first.** The first connection for a host whose upstream has never been observed gets a certificate for that one name — nothing can coalesce onto it.
+- **Then mirror.** On a route that **reflects the inbound name**, the upstream leaf is read during the handshake that was happening anyway (no extra probe, no blocking) and its DNS SANs become this gateway's coverage for that host. Routes with a fixed `override_sni`, and routes that pin a `cert_file`, do not mirror — their coverage is the operator's choice.
+- **Keyed by the requested name.** A SAN set learned while serving `t4.origin.example` is never handed to a client asking for `origin.example`.
+- **Rotation by comparison.** The raw observed set is stored with the certificate. A later handshake presenting a different set — **including a narrower one**, the case that reintroduces `403` — invalidates and re-signs the cached leaf.
+- **Clipping.** A mirrored name is dropped for three reasons: this listener would route it elsewhere; it is a wildcard directly above a public suffix (`*.com`, `*.co.uk`) — only the PSL's **ICANN section** draws that line, so `co.uk` and `co.jp` are boundaries while private-section entries (`github.io`, `withgoogle.com`) are ordinary domains and a genuine `*.withgoogle.com` is mirrored; or the name is simply **unmintable** (an IP literal, a malformed entry, or a multi-level wildcard no TLS client would honor). Dropped names are logged, **by name only** — the reason is not currently emitted.
+- **The requesting host is always in the set.** Whenever the survivors do not cover the name that was actually requested (an upstream `*.example.com` does not cover the apex `example.com`), that host is appended — so "everything was clipped" and "the survivors happen not to cover it" take the same path.
+- **Persisted** per `(scope, host)` as `certs/<scope>/<host>.crt` together with the observed set, so a restart resumes mirroring instead of re-learning. Nothing to migrate, no mode to switch: a leaf that no longer matches what the upstream presents is simply re-issued.
+
+## Upstream pools and adaptive selection
+
+A route's `upstream` may be `@pool_name` (or `@pool_name:8443`), handing selection to a candidate pool with background probing.
+
+- **targets**: an IP, a domain, or a CIDR. Either sample it explicitly with `[N]` (`"104.16.0.0/12[4]"` draws 4 random addresses), or expand the whole range — which is **capped at 64 addresses** and refused at load time above that, with a hint to add `[N]`. Targets can carry `tags`, and a route's `select` narrows to an index or tag subset: multiple conditions are **OR-unioned** (there is no AND and no negation), while an explicitly empty list means **no filter** — the way to widen a template's filter back to everything.
+- **probe**: `mode` is `tcp` / `tls` / `http` — **probing cannot be disabled**. Defaults: healthy `interval = 300s`, `degraded_interval = 30s`, `fail_threshold = 2`, `max_concurrent_probes = 16`; `port` defaults to 443 but **only means anything for `tcp`/`tls`** — writing it in `http` mode is a load-time error (the port lives in the URL). RTT stops at connect, handshake, or first response byte depending on mode.
+- **Two estimators**: a Kalman filter over RTT (with a one-sided CUSUM for regime change), and a **Normal-Inverse-Gamma posterior over log-throughput**. Throughput observations come from **passive completed transfers**, not from probes.
+- **Per-connection sampling**: each eligible candidate is drawn once from the exact Student-t(2α) marginal of its latent mean; score = smoothed RTT (seconds) + `payload_bytes / sampled_throughput`. Best score is dialed.
+- **Stability**: pairwise **hysteresis on the published order** — a challenger must beat the incumbent by a margin of **20% of the incumbent's own score**, with a 5 ms floor (not 20% of the gap). There is also a **sticky incumbent** per route view, but it only runs in throughput mode: with `score_payload_bytes = 0` (the default) selection simply takes the head of the ranked order.
+- **Backoff and retention**: a failing candidate gets exponential probe backoff, while an address that **left the candidate set** (a DNS rotation, a replaced sample) has its Kalman/NIG history parked for 600 s — a fixed constant, not configurable — so it does not relearn from zero when it comes back.
+- **Fallback and projection**: `fallback` is a target index used **only while the healthy set is empty**; with nothing healthy and no fallback, `pick` fails and the route dials nothing. `[pools.<n>.nat64]` `prefixes` (RFC 6052 /96) **synthesize extra IPv6 candidates** per participating candidate (tagged `nat64` + `ipv6`), probed and ranked independently. Subnet priors (/24 for v4, /48 for v6) seed newly appeared addresses — but they are fed by passive throughput observations, so they only have content in throughput mode too.
+
+Three limits worth stating plainly:
+
+1. `score_payload_bytes` defaults to **0**, which switches off the throughput telemetry channel *and* the sampling path — including the sticky incumbent and the subnet priors. Out of the box a pool is plain smoothed-RTT selection over a hysteretic order. Turn it on to get throughput-aware routing.
+2. There is **no convergence or no-regret guarantee**. Uncertainty only ever smooths the ranking; it never gates. Probe success/failure lives in a separate `degraded` flag, not in the posterior.
+3. A pool **takes over the resolution path**: no `lookup_addr`, no dual-stack family racing. Writing `address_family` / `nat64_prefix` / `addr_resolver` **at route scope or on its route template** alongside a pool upstream is therefore rejected at load time, while the same values merely *inherited* from a broader scope stay harmless (the pool owns them). Certificate scope is keyed as `pool={name}`. Resolvers may not dial through a pool.
+
+## Hierarchical configuration
+
+`route → listener → global`, with almost every key overridable at the narrower scope. `use = "template"` reuses a block; **templates cannot nest**. Every struct is `deny_unknown_fields` — a misspelled key is a **startup failure**, not a silent ignore.
+
+## Upstream certificate verification
+
+`[verify] mode` is `"full"` (default), `"chain"`, or `"none"`. Two fields are usually the better answer than weakening: `name` (a fixed verification name) and `pins` — **SPKI pins**, spelled `sha256/<base64>` (RFC 7469 §2.1.1, the same form as `curl --pinnedpubkey`), which apply **in addition to** whatever `mode` requires rather than instead of it. `pins` is replaced wholesale at a deeper scope, never appended to, so a route cannot be quietly held to a set it cannot see. `ca_file` adds a private CA (meaningless under `mode = "none"`, which builds no chain); `trust_webpki` defaults to `true`.
+
+Any policy that weakens verification is **reported at startup**, and it is worth understanding the cost: the client still sees a certificate this gateway's CA signed, so it cannot tell that the far end was not checked.
+
+## ECH, HTTP/2, address families
+
+- `[ech] mode = "doh" | "static" | "doh-with-fallback"` (default `doh`), `require_ech` default `true`, `max_retries` default 2, `ech_refresh` default 1h.
+- `override_sni` distinguishes three cases: omitted = reflect the inbound name; `"name"` = fixed name; `""` = **send no `server_name`**. The empty string is deliberately distinct from omitting the field — useful for an IP-addressed upstream, or one that keys only off the certificate it serves; for ECH, [RFC 9849 §5](https://www.rfc-editor.org/rfc/rfc9849.html#section-5) explicitly allows an inner ClientHello with no `server_name` (the outer hello still carries the ECHConfig public name). Suppressing SNI changes what is **transmitted**, not what is **trusted**.
+- `[http2] enabled` defaults to **false**. `probe = "off" | "warn" | "require"` defaults to `warn`: backends are checked at startup, but the probe **validates and never decides** — no route is silently downgraded to HTTP/1.1, because a cached verdict would go stale on the first backend reload and would hide the misconfiguration this exists to surface. Its scope is narrow: only **`http` routes with `enabled`, `probe != off`, and a fixed direct upstream** are probed. Pool upstreams (nothing settled at startup) and routes that reflect the source SNI/Host (no fixed backend) are skipped, with the reason logged at `debug`. Enabling `http2` on a `raw` route is a load-time error, while a value merely *inherited* from a broader scope is ignored, so a global `enabled = true` coexists with `raw` routes. Cleartext inbound connections cannot use HTTP/2 at all: a prior-knowledge h2c request carries its `:authority` in HPACK-compressed HEADERS, which cannot be read without decoder state, so there is no routing key and such connections fall through to `default_route`.
+- `address_family = "dual" | "ipv4" | "ipv6"` (default `dual`). A dual-stack upstream is **raced on both families** — one unreachable family does not condemn the route. `nat64_prefix` substitutes IPv4→IPv6 while resolving upstream addresses (not in effect under `address_family = "ipv6"`).
+- DNS is used **as a client only**: `system`, `https://` (DoH), `tls://` (DoT), `udp://`, `tcp://`, nameable as `[resolvers.<name>]` with per-hop ECH and verification policy.
+
+## Operational boundaries (please read)
+
+- `ca/ca.key` is a trusted-root private key and is gitignored; distribute only `ca/ca.crt`.
+- Terminating TLS means Himari sees plaintext for the terminating route types.
+- **There is no config hot-reload**: listeners, routes, pools and resolvers need a restart. The only reload that exists is for the **PSL file**, and it is conditional: the watcher starts only with `[psl] auto_reload = true` **and** `source = "file"` **and** that file present at startup (a missing file logs one `info` line and does not arm). `SIGHUP` reloads the PSL unconditionally, and nothing else.
+- It is **not**: an HTTP/SOCKS5 forward proxy (no CONNECT; `type = "http"` is cleartext splicing), a GUI/tray/web app, a DNS interceptor or fake-IP service, and listeners **do not verify client certificates** (no inbound mTLS).
+- Shutdown via Ctrl-C or SIGTERM. The signal stops the gateway with **exit 0**, but there is **no connection draining** — in-flight splices are dropped on the spot. The handler is only installed inside the startup `select`, so a TERM sent *too early* reads as a signal death; an external controller must wait for readiness before stopping, or a user-initiated stop gets misreported as a crash.
+
+## Build
 
 ```sh
-# this machine; generates the CA first if needed
-# Windows: needs Administrator
-# macOS/Linux: needs root/sudo
-sni-gate.exe --install-ca          # Windows
-sudo ./sni-gate --install-ca       # macOS/Linux
+cargo build --release
+./build-release.sh        # reproducible & privacy-hardened: strips symbols, remaps build paths
+
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl   # fully static Linux
+
+RUSTFLAGS="-Ctarget-feature=+crt-static" cargo build --release   # static Windows CRT
 ```
 
-**Windows** writes to the Local Machine Trusted Root Certification Authorities
-store through CryptoAPI in-process — no PowerShell, no `certutil`, no temp
-file. **macOS** uses the standard `security add-trusted-cert` tool.
-**Linux** detects your distribution (Debian/Ubuntu/RHEL/Fedora/Arch) and uses
-the appropriate certificate-management command (`update-ca-certificates`,
-`update-ca-trust`, or `trust extract-compat`).
+A stable Rust toolchain is required (`rust-version = 1.88`); Windows additionally needs NASM and a C toolchain, because `aws-lc-rs` provides the HPKE suites ECH requires.
 
-Installation is idempotent across all platforms: if a certificate with the same
-fingerprint is already trusted, the store is left untouched. Restart the
-browser afterwards to pick up the change.
+## Tests and CI
 
-Setting `ca.install_to_system_root = true` does the same thing on every startup
-instead, and only warns if the store cannot be reached, so the gateway still
-serves traffic. For other devices, distribute `ca/ca.crt` and import it into
-their trusted-root store.
+- **341 test functions** (unit tests in `src/`, integration in `tests/`). `tests/e2e.rs` launches the **real binary** against a mock backend and drives real handshakes: raw byte passthrough, an `http` route terminating TLS and issuing a certificate, unobserved upstreams yielding only exact certificates, cross-route coalescing being structurally impossible, templates end to end, h2 in spliced to an h2c backend, and http/1.1 still negotiated when HTTP/2 is off. Pools add `tests/pool_e2e.rs` (including load-time refusals) and `tests/pool_adaptive_e2e.rs` (exploration and learning between probe cycles).
+- CI runs `cargo fmt --all -- --check` and `cargo clippy --all-targets --locked -- -D warnings`, then build plus the full suite on Linux x86_64, Linux arm64, Windows x86_64 and macOS (aarch64) — the macOS leg is `continue-on-error` so runner capacity cannot block the verdict.
 
-## Security notes
+## Configuration reference
 
-- `ca/ca.key` is a trusted-root private key. Keep it local; it is gitignored.
-- Terminating TLS means sni-gate sees plaintext for terminating route types.
-- Binding to 443/80 requires elevated privileges: Administrator on Windows,
-  root/sudo on macOS/Linux.
-- Upstream certificates are fully verified unless you say otherwise. A
-  [`[verify]`](#upstream-certificate-verification) block that weakens this is
-  reported at startup, and it is worth understanding what it costs: the client
-  still sees a certificate this gateway's CA signed, so it cannot tell that the
-  far end was not checked. `verify.name` and `verify.pins` both keep a real
-  assurance in place and are almost always the better answer than
-  `mode = "chain"` or `"none"`.
-
-## Logging
-
-`SNI_GATE_LOG` / `RUST_LOG` override the config `log` directive:
-
-```sh
-SNI_GATE_LOG=debug sni-gate.exe
-```
+[`sni-gate.example.toml`](sni-gate.example.toml) covers most keys, with per-layer defaults and which combinations are mutually exclusive — but not every one: `cert_file`/`key_file`, `idle_timeout` and `scope_suffix` do not appear there, so those need the field comments in `src/config.rs`.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0.
+Dual-licensed under MIT or Apache-2.0 (see `LICENSE-MIT`, `LICENSE-APACHE`).

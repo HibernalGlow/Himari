@@ -1,0 +1,37 @@
+feat(tui): shelve the neobrutalist terminal UI behind the tui feature
+
+A ratatui front end for the gateway that speaks the same visual language as the
+Iced GUI: the identical palette (pinned against drift by a test), solid 1-cell
+frame rings and hard 2x1 offset shadows in the cell grid, and a press state that
+drops the shadow and slides the face into where it was. Dense tables and prose
+stay unframed, as the spec requires.
+
+Mouse support is first-class, not a bonus: press and release must land on the
+same hotspot to activate, releasing elsewhere cancels, hover lifts the shadow,
+the wheel and drag scroll whichever pane is under the pointer, right and middle
+click have named actions, and double click is detected because crossterm 0.29
+does not report it. Hit areas stay on the unpressed rect, so the press animation
+cannot make a control escape mid-click. Every gesture has a keyboard twin and
+both go through one activate().
+
+The UI supervises the real sni-gate binary as a child process instead of
+embedding it, because the pinned core exposes no counters; so the status page
+reports what it cannot measure rather than a confident zero, keeps "our child
+did X" separate from "this port accepts TCP", and the log pane shows the
+gateway's own lines. It never generates CA material: opening a status screen
+must not write to disk.
+
+Shelved by request, and the shelf is structural: src/lib.rs gates the module on
+the tui feature, ratatui is an optional dependency, and the binary plus its
+three test targets are required-features, so a default build/test/clippy run
+never compiles any of it. Verified with cargo metadata that the seven
+pre-existing test targets are still discovered and run unchanged.
+
+With the feature on: 41 gates pass with zero warnings (23 mouse, 11 visual
+language, 7 source-scan), and a live PTY run at 96x32 exercised the alternate
+screen, mouse capture, SGR coordinates, cursor restore, a click that reached
+activate() and a wheel that scrolled content below the fold into view. The
+verification logs and the PTY probe live in .local/ and are deliberately left
+uncommitted.
+
+Co-Authored-By: Qoder <noreply@qoder.com>

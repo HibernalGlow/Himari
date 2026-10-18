@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="580" viewBox="0 0 1200 580" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">Himari 的连接处理路径 / per-connection path</title>
+  <desc id="dsc">peek 出 SNI 或 Host 但不消费字节，按 exact、wildcard、suffix、regex、default_route 顺序匹配；终止型路由由本地 CA 现签证书后按 ech、tls、http 重新发起，raw 不终止也不签证书。无匹配时执行 unmatched 策略。</desc>
+
+  <defs>
+    <marker id="fa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8C97A3"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="580" rx="20" fill="#0B0D10"/>
+
+  <!-- ============ lane 1: peek -> match -> issue ============ -->
+  <g id="lane1">
+    <!-- 1 client -->
+    <rect x="64" y="56" width="184" height="196" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+    <text x="80" y="84" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">1</text>
+    <text x="104" y="84" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="22" font-weight="600" fill="#E9ECEF">client</text>
+    <text x="80" y="124" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#8C97A3">TLS + SNI</text>
+    <text x="80" y="154" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#8C97A3">HTTP Host</text>
+    <rect x="80" y="176" width="152" height="1" fill="#2A313A"/>
+    <text x="80" y="206" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#5C6672">:443 :80</text>
+    <text x="80" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">[[listener]]</text>
+
+    <path d="M248 154 L270 154" stroke="#8C97A3" stroke-width="1" marker-end="url(#fa)" fill="none"/>
+
+    <!-- 2 peek -->
+    <rect x="272" y="56" width="216" height="196" rx="6" fill="#12161B" stroke="#F5A623" stroke-width="1"/>
+    <text x="288" y="84" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">2</text>
+    <text x="312" y="84" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="22" font-weight="600" fill="#F5A623">peek</text>
+    <text x="288" y="124" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">server_name</text>
+    <text x="288" y="154" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">Host:</text>
+    <rect x="288" y="176" width="184" height="1" fill="#2A313A"/>
+    <text x="288" y="206" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="20" fill="#8C97A3">bytes are not</text>
+    <text x="288" y="234" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="20" fill="#8C97A3">consumed</text>
+
+    <path d="M488 154 L514 154" stroke="#8C97A3" stroke-width="1" marker-end="url(#fa)" fill="none"/>
+
+    <!-- 3 route ladder -->
+    <rect x="516" y="56" width="316" height="196" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+    <text x="532" y="84" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">3</text>
+    <text x="556" y="84" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="22" font-weight="600" fill="#E9ECEF">route · first match wins</text>
+    <text x="532" y="116" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">exact</text>
+    <text x="532" y="146" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">*.wildcard</text>
+    <text x="532" y="176" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">.suffix</text>
+    <text x="532" y="206" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">@regex</text>
+    <text x="532" y="236" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#8C97A3">default_route</text>
+    <text x="692" y="116" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">api.x.test</text>
+    <text x="692" y="146" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">one label</text>
+    <text x="692" y="176" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">any depth</text>
+    <text x="692" y="206" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">scope_suffix</text>
+
+    <path d="M832 154 L858 154" stroke="#8C97A3" stroke-width="1" marker-end="url(#fa)" fill="none"/>
+
+    <!-- 4 issue -->
+    <rect x="860" y="56" width="276" height="196" rx="6" fill="#171C22" stroke="#F5A623" stroke-width="1"/>
+    <text x="876" y="84" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">4</text>
+    <text x="900" y="84" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="22" font-weight="600" fill="#F5A623">terminate + issue</text>
+    <text x="876" y="124" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">local CA</text>
+    <text x="876" y="154" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">SAN mirrored</text>
+    <text x="876" y="184" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">cached + stored</text>
+    <rect x="876" y="198" width="244" height="1" fill="#2A313A"/>
+    <text x="876" y="228" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="20" fill="#8C97A3">coverage is never guessed</text>
+  </g>
+
+  <!-- ============ lane 2: re-origination ============ -->
+  <g id="lane2">
+    <!-- fan-out from the terminating stage to the three terminating types -->
+    <path d="M998 252 L998 272" stroke="#8C97A3" stroke-width="1" fill="none"/>
+    <path d="M476 272 L1020 272" stroke="#8C97A3" stroke-width="1" fill="none"/>
+    <path d="M476 272 L476 292" stroke="#8C97A3" stroke-width="1" marker-end="url(#fa)" fill="none"/>
+    <path d="M756 272 L756 292" stroke="#8C97A3" stroke-width="1" marker-end="url(#fa)" fill="none"/>
+    <path d="M1020 272 L1020 292" stroke="#8C97A3" stroke-width="1" marker-end="url(#fa)" fill="none"/>
+
+    <!-- raw: never enters stage 4 -->
+    <rect x="64" y="292" width="264" height="96" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1" stroke-dasharray="5 5"/>
+    <text x="80" y="322" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#8C97A3">raw</text>
+    <text x="80" y="350" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">bare TCP splice</text>
+    <text x="80" y="374" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">no cert · no ALPN</text>
+
+    <rect x="344" y="292" width="264" height="96" rx="6" fill="#12161B" stroke="#38D6C0" stroke-width="1"/>
+    <text x="360" y="322" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#38D6C0">ech</text>
+    <text x="360" y="350" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">TLS 1.3 + ECH</text>
+    <text x="360" y="374" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">inner hello hides SNI</text>
+
+    <rect x="624" y="292" width="264" height="96" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+    <text x="640" y="322" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#E9ECEF">tls</text>
+    <text x="640" y="350" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">plain TLS</text>
+    <text x="640" y="374" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">override_sni</text>
+
+    <rect x="904" y="292" width="232" height="96" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+    <text x="920" y="322" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#E9ECEF">http</text>
+    <text x="920" y="350" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">cleartext</text>
+    <text x="920" y="374" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">h2 in &#8594; h2c out</text>
+  </g>
+
+  <!-- ============ lane 3: no match + inheritance ============ -->
+  <g id="lane3">
+    <rect x="64" y="424" width="516" height="100" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+    <text x="80" y="454" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="22" font-weight="600" fill="#E9ECEF">no route matched</text>
+    <text x="80" y="484" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#8C97A3">unmatched = "close"</text>
+    <text x="80" y="510" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#8C97A3">"system-outbound" · passthrough</text>
+
+    <rect x="604" y="424" width="532" height="100" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+    <text x="620" y="454" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="22" font-weight="600" fill="#E9ECEF">hierarchical config</text>
+    <text x="620" y="484" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#8C97A3">route &#8594; listener &#8594; global</text>
+    <text x="620" y="510" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#8C97A3">use = "template"</text>
+  </g>
+</svg>

@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">Himari — 多监听 TLS 网关 / multi-listener TLS gateway</title>
+  <desc id="dsc">ClientHello 被 peek 出不消费的 SNI，网关据此路由并按该名字现签证书；上游类型为 ech、tls、http、raw。</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8C97A3"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="420" rx="20" fill="#0B0D10"/>
+
+  <!-- ============ title block ============ -->
+  <g id="title-block">
+    <!-- peek motif: bracket pair around the eyebrow -->
+    <path d="M76 66 L64 66 L64 90 L76 90" stroke="#F5A623" stroke-width="2" fill="none"/>
+    <path d="M512 66 L524 66 L524 90 L512 90" stroke="#F5A623" stroke-width="2" fill="none"/>
+    <text x="90" y="86" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" letter-spacing="1.6" fill="#8C97A3">TLS GATEWAY · SNI / HOST ROUTING</text>
+
+    <text x="64" y="156" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="68" font-weight="700" fill="#E9ECEF">Himari</text>
+
+    <text x="64" y="204" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="26" font-weight="600" fill="#F5A623">按 SNI / Host 路由，证书现签现用</text>
+    <text x="64" y="240" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="21" fill="#8C97A3">Routes every connection by SNI or Host.</text>
+    <text x="64" y="268" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif" font-size="21" fill="#8C97A3">Signs that name's certificate on the fly.</text>
+
+    <rect x="64" y="300" width="560" height="1" fill="#2A313A"/>
+    <text x="64" y="344" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">v2.5.1 · Rust 1.88 · MIT OR Apache-2.0</text>
+  </g>
+
+  <!-- ============ proof: what one connection produces ============ -->
+  <g id="proof">
+    <!-- 1. the peek -->
+    <rect x="664" y="56" width="472" height="96" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+    <text x="680" y="80" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" fill="#8C97A3">ClientHello</text>
+    <text x="1000" y="80" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" fill="#5C6672">peeked</text>
+
+    <g id="bytes">
+      <rect x="680" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="708" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="736" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="764" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="792" y="92" width="110" height="22" rx="2" fill="#F5A623" fill-opacity="0.22" stroke="#F5A623" stroke-width="1"/>
+      <rect x="904" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="932" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="960" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="988" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="1016" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="1044" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+      <rect x="1072" y="92" width="26" height="22" rx="2" fill="#171C22"/>
+    </g>
+    <path d="M792 120 L792 128 M792 128 L902 128 M902 128 L902 120" stroke="#F5A623" stroke-width="2" fill="none"/>
+    <text x="680" y="146" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#F5A623">server_name</text>
+    <text x="848" y="146" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">api.example.test</text>
+
+    <!-- 2. the issued leaf -->
+    <rect x="664" y="176" width="472" height="100" rx="6" fill="#171C22" stroke="#F5A623" stroke-width="1"/>
+    <text x="680" y="202" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" fill="#8C97A3">leaf</text>
+    <text x="744" y="202" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">api.example.test</text>
+    <text x="680" y="232" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" fill="#8C97A3">SAN</text>
+    <text x="744" y="232" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">api.example.test</text>
+    <text x="680" y="260" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" fill="#5C6672">+</text>
+    <text x="744" y="260" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#E9ECEF">*.api.example.test</text>
+
+    <!-- 3. upstream types -->
+    <g id="upstreams">
+      <rect x="664" y="300" width="110" height="60" rx="6" fill="#12161B" stroke="#38D6C0" stroke-width="1"/>
+      <text x="680" y="326" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#38D6C0">ech</text>
+      <text x="680" y="348" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">TLS1.3</text>
+
+      <rect x="786" y="300" width="110" height="60" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+      <text x="802" y="326" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#E9ECEF">tls</text>
+      <text x="802" y="348" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">re-issue</text>
+
+      <rect x="908" y="300" width="110" height="60" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1"/>
+      <text x="924" y="326" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#E9ECEF">http</text>
+      <text x="924" y="348" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">splice</text>
+
+      <rect x="1030" y="300" width="106" height="60" rx="6" fill="#12161B" stroke="#2A313A" stroke-width="1" stroke-dasharray="4 4"/>
+      <text x="1046" y="326" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#8C97A3">raw</text>
+      <text x="1046" y="348" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#5C6672">no cert</text>
+    </g>
+
+    <path d="M1104 152 L1104 176" stroke="#8C97A3" stroke-width="1" marker-end="url(#ah)" fill="none"/>
+    <path d="M1104 276 L1104 300" stroke="#8C97A3" stroke-width="1" marker-end="url(#ah)" fill="none"/>
+  </g>
+</svg>

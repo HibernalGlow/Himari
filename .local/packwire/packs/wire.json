@@ -1,0 +1,1 @@
+[{"name":"manual-wire","kind":"tls","host":"packtest.invalid","upstream":"","override_sni":"spoofed.test","include_subdomains":false}]

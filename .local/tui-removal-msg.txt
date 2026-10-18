@@ -1,0 +1,27 @@
+chore(tui): remove the shelved terminal UI from this branch
+
+Stood down by request, and now taken out of the branch tree rather than left
+in it behind a feature flag: a shelf that still ships source, tests and CI
+comments is still a surface somebody has to reason about.
+
+Deleted: src/tui/ (tokens, paint, input, widgets, gate, snapshot, app, view,
+mod), src/bin/sni-gate-tui.rs, src/lib.rs (which existed only so the TUI could
+reuse the config loader), tests/tui_visual_language.rs, tests/tui_mouse.rs,
+tests/tui_surfaces.rs, docs/tui.md.
+
+Restored byte-for-byte to the pre-TUI state (e6e807e):
+- Cargo.toml — no ratatui, no `tui` feature, no gated bin or test targets.
+- Cargo.lock — the 91 packages ratatui brought in are gone again.
+- .github/workflows/ci.yml — the five comment lines that explained the
+  exclusion are gone, so CI has no TUI trace left at all.
+docs/design-language.md keeps the GUI half (§1-5); §6 and the two §5
+cross-references into it are removed.
+
+Verified by content, not by trust: `git diff e6e807e -- Cargo.toml Cargo.lock
+src tests .github` is empty, so the buildable tree is upstream's again. The
+PTY probe and gate script stayed uncommitted under .local/.
+
+To resume: `git checkout 2f2b4d2 -- src/tui src/lib.rs src/bin tests/tui_visual_language.rs
+tests/tui_mouse.rs tests/tui_surfaces.rs docs/tui.md Cargo.toml Cargo.lock
+.github/workflows/ci.yml`, then re-read docs/tui.md on that commit for the
+shelf notes and mouse contract.
